@@ -667,7 +667,24 @@ def render_car_card(col, badge_class, badge_text, car_name, fuel_type, year, kms
 
 # ── Main App ─────────────────────────────────────────────────────────────────
 
+def auto_train_if_needed():
+    """Run model_trainer.py automatically if model_artifacts/ doesn't exist.
+    This ensures the app works on Streamlit Cloud where artifacts aren't committed."""
+    if not os.path.exists('model_artifacts') or not os.path.exists('model_artifacts/random_forest.pkl'):
+        with st.spinner("First run detected — training ML models... this takes ~60 seconds"):
+            import subprocess, sys
+            result = subprocess.run([sys.executable, 'model_trainer.py'],
+                                    capture_output=True, text=True)
+            if result.returncode != 0:
+                st.error("Model training failed:\n" + result.stderr)
+                st.stop()
+            st.cache_resource.clear()
+            st.cache_data.clear()
+
 def main():
+    # Auto-train if running on cloud (model_artifacts not committed to git)
+    auto_train_if_needed()
+
     # Load artifacts
     artifacts, le_dict, feature_cols, model_results, stats = load_artifacts()
     df = load_dataset()
