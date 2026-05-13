@@ -3,6 +3,7 @@ model_trainer.py - ML Model Training Script for Car Price Predictor
 Trains multiple models and saves the best one
 """
 
+import datetime
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
@@ -14,6 +15,10 @@ import joblib
 import os
 import warnings
 warnings.filterwarnings('ignore')
+
+# Reference year used for Car_Age = current year at training time.
+# Stored as an artifact so app.py uses the same baseline for predictions.
+REFERENCE_YEAR = datetime.date.today().year
 
 try:
     from xgboost import XGBRegressor
@@ -30,8 +35,13 @@ def load_and_preprocess(filepath='car_data.csv'):
     df.drop_duplicates(inplace=True)
     df.dropna(inplace=True)
 
-    # Feature: Car Age
-    df['Car_Age'] = 2024 - df['Year']
+    # Feature: Car Age (uses REFERENCE_YEAR so it stays correct across calendar years)
+    df['Car_Age'] = REFERENCE_YEAR - df['Year']
+
+    # Normalise Selling_Price to ₹ Lakhs. The raw CSV stores values in rupees
+    # (e.g. 371643.49). All downstream model outputs and UI labels are in Lakhs.
+    if df['Selling_Price'].max() > 10_000:          # heuristic: raw rupees
+        df['Selling_Price'] = df['Selling_Price'] / 1_00_000
 
     # Convert numeric columns — handle cases where values may contain units
     for col in ['Mileage', 'Engine', 'Max_Power']:
@@ -57,13 +67,15 @@ def load_and_preprocess(filepath='car_data.csv'):
 
 
 def get_features_target(df):
-    # FIX: Include Car_Name_enc so the car brand affects the prediction.
+    # Present_Price captures brand/model premium and is the strongest resale predictor.
     # Selling_Price is the TARGET — never include it in features (data leakage).
-    feature_cols = [
-        'Car_Name_enc',
-        'Car_Age', 'Kms_Driven', 'Mileage', 'Engine', 'Max_Power', 'Seats',
-        'Fuel_Type_enc', 'Seller_Type_enc', 'Transmission_enc', 'Owner_enc'
-    ]
+    present_price_cols = ['Present_Price'] if 'Present_Price' in df.columns else []
+    feature_cols = (
+        ['Car_Name_enc']
+        + present_price_cols
+        + ['Car_Age', 'Kms_Driven', 'Mileage', 'Engine', 'Max_Power', 'Seats',
+           'Fuel_Type_enc', 'Seller_Type_enc', 'Transmission_enc', 'Owner_enc']
+    )
     X = df[feature_cols]
     y = df['Selling_Price']
     return X, y, feature_cols
@@ -115,6 +127,8 @@ def save_artifacts(trained_models, le_dict, feature_cols, results, df):
 
     joblib.dump(le_dict, 'model_artifacts/label_encoders.pkl')
     joblib.dump(feature_cols, 'model_artifacts/feature_cols.pkl')
+    # Save the reference year so app.py uses the identical Car_Age baseline
+    joblib.dump(REFERENCE_YEAR, 'model_artifacts/reference_year.pkl')
 
     # Save model results (strip model objects)
     results_clean = {k: {m: v for m, v in val.items() if m != 'model'} for k, val in results.items()}
@@ -126,7 +140,7 @@ def save_artifacts(trained_models, le_dict, feature_cols, results, df):
         'fuel_types': df['Fuel_Type'].unique().tolist(),
         'seller_types': df['Seller_Type'].unique().tolist(),
         'transmissions': df['Transmission'].unique().tolist(),
-        'owner_values': sorted(df['Owner'].unique().tolist()),   # FIX: store actual string values
+        'owner_values': sorted(df['Owner'].unique().tolist()),
         'year_min': int(df['Year'].min()),
         'year_max': int(df['Year'].max()),
         'kms_min': int(df['Kms_Driven'].min()),
@@ -138,11 +152,17 @@ def save_artifacts(trained_models, le_dict, feature_cols, results, df):
         'max_power_min': float(df['Max_Power'].min()),
         'max_power_max': float(df['Max_Power'].max()),
         'seats_values': sorted(df['Seats'].dropna().unique().astype(int).tolist()),
+        # Selling_Price is already in ₹ Lakhs after preprocessing
         'price_min': float(df['Selling_Price'].min()),
         'price_max': float(df['Selling_Price'].max()),
         'price_mean': float(df['Selling_Price'].mean()),
         'total_records': len(df),
     }
+    # Include Present_Price range if the column exists (used in prediction form)
+    if 'Present_Price' in df.columns:
+        stats['present_price_min'] = float(df['Present_Price'].min())
+        stats['present_price_max'] = float(df['Present_Price'].max())
+        stats['present_price_mean'] = float(df['Present_Price'].mean())
     joblib.dump(stats, 'model_artifacts/dataset_stats.pkl')
 
     print("\n📦 All artifacts saved to model_artifacts/")

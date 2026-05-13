@@ -11,6 +11,7 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 import joblib
 import os
+import datetime
 import warnings
 import time
 warnings.filterwarnings('ignore')
@@ -552,61 +553,92 @@ st.markdown("""
 def load_artifacts():
     """Load ML model artifacts"""
     try:
-        artifacts = {}
         art_dir = 'model_artifacts'
-        
-        for model_file in ['random_forest.pkl', 'gradient_boosting.pkl', 'ridge_regression.pkl', 'xgboost.pkl']:
-            path = os.path.join(art_dir, model_file)
+        # Require the full set — a partial training run would cause confusing errors later
+        required = ['label_encoders.pkl', 'feature_cols.pkl', 'model_results.pkl', 'dataset_stats.pkl']
+        for req in required:
+            if not os.path.exists(os.path.join(art_dir, req)):
+                return None, None, None, None, None, None
+
+        artifacts = {}
+        # Map filename → canonical display name (must match keys used in model_results)
+        model_files = {
+            'random_forest.pkl':    'Random Forest',
+            'gradient_boosting.pkl':'Gradient Boosting',
+            'ridge_regression.pkl': 'Ridge Regression',
+            'xgboost.pkl':          'XGBoost',
+        }
+        for fname, display_name in model_files.items():
+            path = os.path.join(art_dir, fname)
             if os.path.exists(path):
-                name = model_file.replace('.pkl', '').replace('_', ' ').title()
-                artifacts[name] = joblib.load(path)
-        
-        le_dict = joblib.load(os.path.join(art_dir, 'label_encoders.pkl'))
+                artifacts[display_name] = joblib.load(path)
+
+        le_dict      = joblib.load(os.path.join(art_dir, 'label_encoders.pkl'))
         feature_cols = joblib.load(os.path.join(art_dir, 'feature_cols.pkl'))
-        model_results = joblib.load(os.path.join(art_dir, 'model_results.pkl'))
-        stats = joblib.load(os.path.join(art_dir, 'dataset_stats.pkl'))
-        
-        return artifacts, le_dict, feature_cols, model_results, stats
-    except Exception as e:
-        return None, None, None, None, None
+        model_results= joblib.load(os.path.join(art_dir, 'model_results.pkl'))
+        stats        = joblib.load(os.path.join(art_dir, 'dataset_stats.pkl'))
+
+        # Reference year — fall back to current year if artifact pre-dates this fix
+        ref_year_path = os.path.join(art_dir, 'reference_year.pkl')
+        reference_year = (joblib.load(ref_year_path)
+                          if os.path.exists(ref_year_path)
+                          else datetime.date.today().year)
+
+        return artifacts, le_dict, feature_cols, model_results, stats, reference_year
+    except Exception:
+        return None, None, None, None, None, None
 
 
 @st.cache_data
 def load_dataset():
-    """Load the raw dataset"""
+    """Load the raw dataset; normalise units to match model training."""
     try:
         df = pd.read_csv('car_data.csv')
         df.columns = df.columns.str.strip()
-        df['Car_Age'] = 2024 - df['Year']
+        # Convert Selling_Price to ₹ Lakhs — same heuristic used in model_trainer.py
+        if df['Selling_Price'].max() > 10_000:
+            df['Selling_Price'] = df['Selling_Price'] / 1_00_000
+        df['Car_Age'] = datetime.date.today().year - df['Year']
         return df
-    except:
+    except Exception:
         return None
 
 
-def predict_price(model, le_dict, feature_cols, car_name, year, kms_driven,
+def predict_price(model, le_dict, feature_cols, reference_year,
+                  car_name, year, kms_driven,
                   mileage, engine, max_power, seats,
-                  fuel_type, seller_type, transmission, owner):
-    """Predict car price — encodes all features dynamically from feature_cols
+                  fuel_type, seller_type, transmission, owner,
+                  present_price=None):
+    """Predict car price (₹ Lakhs). Encodes all features from feature_cols
     so adding/removing features never causes a column-count mismatch."""
-    car_age = 2024 - year
+    car_age = reference_year - year
 
-    def safe_encode(le, value):
+    def safe_encode(le, value, col_name):
         classes = list(le.classes_)
-        return le.transform([value if value in classes else classes[0]])[0]
+        if value not in classes:
+            import warnings
+            warnings.warn(
+                f"Value '{value}' not seen during training for column '{col_name}'. "
+                f"Falling back to '{classes[0]}'. Prediction may be inaccurate.",
+                UserWarning, stacklevel=2
+            )
+            return le.transform([classes[0]])[0]
+        return le.transform([value])[0]
 
     # Full value map — covers every possible feature column
     all_values = {
-        'Car_Name_enc':    safe_encode(le_dict['Car_Name'],     car_name),
-        'Car_Age':         car_age,
-        'Kms_Driven':      kms_driven,
-        'Mileage':         mileage,
-        'Engine':          engine,
-        'Max_Power':       max_power,
-        'Seats':           seats,
-        'Fuel_Type_enc':   safe_encode(le_dict['Fuel_Type'],    fuel_type),
-        'Seller_Type_enc': safe_encode(le_dict['Seller_Type'],  seller_type),
-        'Transmission_enc':safe_encode(le_dict['Transmission'], transmission),
-        'Owner_enc':       safe_encode(le_dict['Owner'],        owner),
+        'Car_Name_enc':     safe_encode(le_dict['Car_Name'],     car_name,     'Car_Name'),
+        'Present_Price':    present_price if present_price is not None else 0.0,
+        'Car_Age':          car_age,
+        'Kms_Driven':       kms_driven,
+        'Mileage':          mileage,
+        'Engine':           engine,
+        'Max_Power':        max_power,
+        'Seats':            seats,
+        'Fuel_Type_enc':    safe_encode(le_dict['Fuel_Type'],    fuel_type,    'Fuel_Type'),
+        'Seller_Type_enc':  safe_encode(le_dict['Seller_Type'],  seller_type,  'Seller_Type'),
+        'Transmission_enc': safe_encode(le_dict['Transmission'], transmission, 'Transmission'),
+        'Owner_enc':        safe_encode(le_dict['Owner'],        owner,        'Owner'),
     }
     # Select only the columns this model was trained on (order matters)
     row = [[all_values[c] for c in feature_cols]]
@@ -641,7 +673,8 @@ def render_car_card(col, badge_class, badge_text, car_name, fuel_type, year, kms
     color = get_color_hex(fuel_type)
     kms_fmt = "{:,}".format(int(kms))
     rupee = chr(8377)
-    price_str = rupee + "{:,.0f}".format(price) if price else chr(8212)
+    # price is in ₹ Lakhs — format as "₹X.XXL"
+    price_str = rupee + "{:.2f}L".format(price) if price else chr(8212)
     trophy = chr(127942)
     winner_div = ("<div class=\"winner-tag\">" + trophy + " BEST VALUE</div>" if (is_winner and price) else "")
     html = (
@@ -668,9 +701,15 @@ def render_car_card(col, badge_class, badge_text, car_name, fuel_type, year, kms
 # ── Main App ─────────────────────────────────────────────────────────────────
 
 def auto_train_if_needed():
-    """Run model_trainer.py automatically if model_artifacts/ doesn't exist.
+    """Run model_trainer.py automatically if model_artifacts/ is missing or incomplete.
     This ensures the app works on Streamlit Cloud where artifacts aren't committed."""
-    if not os.path.exists('model_artifacts') or not os.path.exists('model_artifacts/random_forest.pkl'):
+    required = [
+        'model_artifacts/random_forest.pkl',
+        'model_artifacts/label_encoders.pkl',
+        'model_artifacts/feature_cols.pkl',
+        'model_artifacts/dataset_stats.pkl',
+    ]
+    if not all(os.path.exists(p) for p in required):
         with st.spinner("First run detected — training ML models... this takes ~60 seconds"):
             import subprocess, sys
             result = subprocess.run([sys.executable, 'model_trainer.py'],
@@ -686,7 +725,7 @@ def main():
     auto_train_if_needed()
 
     # Load artifacts
-    artifacts, le_dict, feature_cols, model_results, stats = load_artifacts()
+    artifacts, le_dict, feature_cols, model_results, stats, reference_year = load_artifacts()
     df = load_dataset()
     model_ready = artifacts is not None and len(artifacts) > 0
     
@@ -751,7 +790,7 @@ def main():
             with c2:
                 st.markdown(f"""
                 <div class="metric-card">
-                    <span class="metric-value">₹{stats['price_mean']/100000:.1f}L</span>
+                    <span class="metric-value">₹{stats['price_mean']:.1f}L</span>
                     <div class="metric-label">💰 Avg Price</div>
                 </div>""", unsafe_allow_html=True)
             with c3:
@@ -881,6 +920,17 @@ def main():
                 max_power = st.number_input("Max Power (bhp)", min_value=30.0, max_value=500.0, value=80.0, step=1.0)
                 seats = st.selectbox("Seats", stats.get('seats_values', [2, 4, 5, 6, 7, 8]), index=2, key="pred_seats")
                 transmission = st.selectbox("Transmission", stats['transmissions'], key="pred_trans")
+            # Present_Price (ex-showroom, ₹ Lakhs) — shown only when in feature set
+            present_price = None
+            if 'Present_Price' in feature_cols:
+                pp_default = round(stats.get('present_price_mean', 8.0), 1)
+                pp_min = round(stats.get('present_price_min', 1.0), 1)
+                pp_max = round(stats.get('present_price_max', 100.0), 1)
+                present_price = st.number_input(
+                    "Present Price / Ex-showroom (₹ Lakhs)",
+                    min_value=pp_min, max_value=pp_max, value=pp_default, step=0.5,
+                    help="Current ex-showroom price of the car model (₹ Lakhs)"
+                )
             
             model_choice = st.selectbox("🤖 ML Model", list(artifacts.keys()))
             st.markdown('</div>', unsafe_allow_html=True)
@@ -894,10 +944,11 @@ def main():
                 with st.spinner("Analyzing market data..."):
                     time.sleep(0.6)
                     model = artifacts[model_choice]
-                    price = predict_price(model, le_dict, feature_cols,
+                    price = predict_price(model, le_dict, feature_cols, reference_year,
                         car_name, year, kms_driven,
                         mileage, engine, max_power, seats,
-                        fuel_type, seller_type, transmission, owner)
+                        fuel_type, seller_type, transmission, owner,
+                        present_price=present_price)
                 
                 # Confidence band
                 low = price * 0.88
@@ -909,9 +960,9 @@ def main():
                 <div class="price-display">
                     <div style="font-size:5rem; margin-bottom:8px; filter:drop-shadow(0 0 20px rgba(0,212,255,0.5));">{emoji}</div>
                     <div class="price-currency">ESTIMATED VALUE</div>
-                    <span class="price-amount">₹{price:,.0f}</span>
+                    <span class="price-amount">₹{price:.2f}L</span>
                     <div style="margin-top:12px; color:rgba(224,224,255,0.4); font-size:0.75rem; letter-spacing:2px;">
-                        RANGE: ₹{low:,.0f} – ₹{high:,.0f}
+                        RANGE: ₹{low:.2f}L – ₹{high:.2f}L
                     </div>
                     <div style="margin-top:16px; display:flex; gap:8px; justify-content:center; flex-wrap:wrap;">
                         <span style="background:rgba(0,212,255,0.1); border:1px solid rgba(0,212,255,0.3); 
@@ -926,13 +977,12 @@ def main():
                 
                 # Market position indicator
                 st.markdown("<br>", unsafe_allow_html=True)
-                avg_price = stats['price_mean']
-                position_pct = min(100, max(0, (price / avg_price) * 50))
+                avg_price = stats['price_mean']   # already in ₹ Lakhs
 
                 fig_gauge = go.Figure(go.Indicator(
                     mode="gauge+number",
                     value=price,
-                    number={'valueformat': '.0f', 'suffix': ' ₹', 'font': {'color': '#00d4ff', 'family': 'Orbitron', 'size': 22}},
+                    number={'valueformat': '.2f', 'suffix': 'L', 'prefix': '₹', 'font': {'color': '#00d4ff', 'family': 'Orbitron', 'size': 22}},
                     gauge={
                         'axis': {'range': [stats['price_min'], stats['price_max']], 'tickcolor': 'rgba(0,212,255,0.4)'},
                         'bar': {'color': 'rgba(0,212,255,0.8)', 'thickness': 0.3},
@@ -945,7 +995,7 @@ def main():
                         ],
                         'threshold': {'line': {'color': '#ffd700', 'width': 3}, 'value': avg_price}
                     },
-                    title={'text': f"vs Market Avg: ₹{avg_price:,.0f}", 'font': {'color': 'rgba(224,224,255,0.6)', 'size': 11, 'family': 'Rajdhani'}}
+                    title={'text': f"vs Market Avg: ₹{avg_price:.2f}L", 'font': {'color': 'rgba(224,224,255,0.6)', 'size': 11, 'family': 'Rajdhani'}}
                 ))
                 fig_gauge.update_layout(
                     paper_bgcolor='rgba(0,0,0,0)',
@@ -1034,10 +1084,12 @@ def main():
             with st.spinner("Computing valuations..."):
                 time.sleep(0.5)
                 model = artifacts[model_choice]
-                price_a = predict_price(model, le_dict, feature_cols, a_name, a_year, a_kms,
+                price_a = predict_price(model, le_dict, feature_cols, reference_year,
+                                        a_name, a_year, a_kms,
                                         a_mileage, a_engine, a_max_power, a_seats,
                                         a_fuel, a_seller, a_trans, a_owner)
-                price_b = predict_price(model, le_dict, feature_cols, b_name, b_year, b_kms,
+                price_b = predict_price(model, le_dict, feature_cols, reference_year,
+                                        b_name, b_year, b_kms,
                                         b_mileage, b_engine, b_max_power, b_seats,
                                         b_fuel, b_seller, b_trans, b_owner)
             
@@ -1051,10 +1103,10 @@ def main():
             # Bar comparison chart
             st.markdown("<br>", unsafe_allow_html=True)
             metrics = {
-                'Predicted Price (₹)': [price_a, price_b],
+                'Predicted Price (₹L)': [price_a, price_b],
                 'Mileage (kmpl)': [a_mileage, b_mileage],
                 'KMs Driven (×1000)': [a_kms/1000, b_kms/1000],
-                'Car Age (years)': [2024-a_year, 2024-b_year],
+                'Car Age (years)': [reference_year - a_year, reference_year - b_year],
                 'Engine (cc×0.1)': [a_engine/10, b_engine/10],
             }
             
@@ -1151,7 +1203,7 @@ def main():
                     HIGHER VALUE: {winner.upper()}
                 </div>
                 <div style="color:rgba(255,215,0,0.6); font-size:0.85rem; margin-top:8px; letter-spacing:1px;">
-                    ₹{diff/100000:.2f}L higher estimated value over the alternative
+                    ₹{diff:.2f}L higher estimated value over the alternative
                 </div>
             </div>
             """, unsafe_allow_html=True)
@@ -1362,11 +1414,13 @@ def main():
         with c1:
             fig_perf = go.Figure()
             colors = ['#00d4ff', '#ff6b35', '#00ff88', '#7b2ff7', '#ffd700']
+            radar_axes = ['R² Score', 'MAE Score', 'RMSE Score']
             for i, name in enumerate(model_names):
                 fig_perf.add_trace(go.Scatterpolar(
-                    r=[r2_vals[i], mae_inv[i], rmse_inv[i], r2_vals[i]],
-                    theta=['R² Score', 'MAE Score', 'RMSE Score', 'R² Score'],
-                    fill='toself', fillcolor=f'rgba({int(colors[i][1:3],16)},{int(colors[i][3:5],16)},{int(colors[i][5:7],16)},0.1)',
+                    r=[r2_vals[i], mae_inv[i], rmse_inv[i]],
+                    theta=radar_axes,
+                    fill='toself',
+                    fillcolor=f'rgba({int(colors[i][1:3],16)},{int(colors[i][3:5],16)},{int(colors[i][5:7],16)},0.1)',
                     line=dict(color=colors[i], width=2), name=name
                 ))
             fig_perf.update_layout(
